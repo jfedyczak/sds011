@@ -1,0 +1,11 @@
+{
+  "name": "sds011",
+  "version": "1.0.0",
+  "main": "index.js",
+  "repository": "git@github.com:jfedyczak/sds011.git",
+  "author": "Jakub Fedyczak <jakub@fedyczak.net>",
+  "license": "MIT",
+  "dependencies": {
+    "serialport": "^6.0.5"
+  }
+}

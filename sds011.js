@@ -1,8 +1,7 @@
 "use strict"
 
-const fs = require('fs')
 const EventEmitter = require('events')
-const exec = require('child_process').exec
+const SerialPort = require('serialport')
 
 const PM_GRADES = ['very good', 'good', 'moderate', 'acceptable', 'bad', 'very bad']
 const PM10_LIMITS = [20, 60, 100, 140, 200, Infinity]
@@ -14,51 +13,149 @@ const scale = (v, scale) => {
 	}
 }
 
-
-const _sds011 = module.exports = {
-	init: (filename, callback) => {
-		let ee = new EventEmitter()
-
-		const parseLine = (line) => {
-			let readout = {
-				pm10: ((line[1] << 8) + line[0]) / 10,
-				pm25: ((line[3] << 8) + line[2]) / 10
-			}
-			readout.pm10_grade = scale(readout.pm10, PM10_LIMITS)
-			readout.pm25_grade = scale(readout.pm25, PM25_LIMITS)
-			ee.emit('readout', readout)
-		}
-
-		let buffer = new Buffer(0)
-
-		exec(`stty -F ${filename} 9600 raw`, (err) => {
-			if (err) return callback(err)
-			fs.createReadStream(filename)
-				.on('data', (data) => {
-					buffer = Buffer.concat([buffer, data])
-					while (1) {
-						let i = buffer.indexOf('aac0', 'hex')
-						if (i == -1) break
-						buffer = buffer.slice(i)
-						if (buffer.length < 10) break
-						let line = buffer.slice(2, 10)
-						buffer = buffer.slice(10)
-						parseLine(line)
-					}
-				})
-			callback(null, ee)
+class SDS011 extends EventEmitter {
+	constructor(device, baud) {
+		super()
+		this.buffer = Buffer.from('')
+		this.sp = new SerialPort(device, {
+			baudRate: 9600,
+		}).on('data', (data) => {
+			this.parseResponse(data)
+		}).on('open', () => {
+			this.ready()
 		})
+	}
+	checksum(data) {
+		let cs = 0
+		for (let i = 0; i < data.length; i++)
+			cs += data[i]
+		return cs % 256
+	}
+	sendCommand(payload) {
+		let buf = Buffer.allocUnsafe(payload.length + 3)
+		buf[0] = 0xaa
+		buf[buf.length - 1] = 0xab
+		buf[buf.length - 2] = this.checksum(payload.slice(1))
+		payload.copy(buf, 1)
+		this.sp.write(buf)
+	}
+	parseResponse(data) {
+		if (data.length < 5) return
+		if (data[0] !== 0xaa || data[data.length - 1] !== 0xab) return
+		if (this.checksum(data.slice(2, data.length - 2)) !== data[data.length - 2]) return
+		if (data[1] === 0xc0 && data.length === 10) {
+			// readout
+			let resp = {
+				type: 'readout',
+				ts: +new Date(),
+				pm10: ((data[3] << 8) + data[2]) / 10,
+				pm25: ((data[5] << 8) + data[4]) / 10,
+				id: data.slice(6, 8).toString('hex'),
+			}
+			this.emit('response', resp)
+		} else if (data[1] === 0xc5 && data[2] === 0x07) {
+			// firmware version
+			let resp = {
+				type: 'version',
+				y: data[3],
+				m: data[4],
+				d: data[5],
+				id: data.slice(6, 8).toString('hex'),
+			}
+			this.emit('response', resp)
+		} else if (data[1] === 0xc5 && data[2] === 0x02) {
+			// reporting mode
+			let resp = {
+				type: 'repmode',
+				active: data[4] === 0,
+			}
+			this.emit('response', resp)
+		} else if (data[1] === 0xc5 && data[2] === 0x05) {
+			// id changed
+			let resp = {
+				type: 'newid',
+				id: data.slice(6,8).toString('hex'),
+			}
+			this.emit('response', resp)
+		} else if (data[1] === 0xc5 && data[2] === 0x06) {
+			// power mode
+			let resp = {
+				type: 'power',
+				sleep: data[4] === 0,
+			}
+			this.emit('response', resp)
+		} else if (data[1] === 0xc5 && data[2] === 0x08) {
+			// interval
+			let resp = {
+				type: 'cycle',
+				interval: data[4],
+			}
+			this.emit('response', resp)
+		} else {
+			console.log(` -- unknown command: ${data.toString('hex').replace(/(..)/g, '$1 ')}`)
+		}
+	}
+	cmdVersion() {
+		this.sendCommand(Buffer.from([0xb4, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff]))
+	}
+	cmdSetReportingMode(active) {
+		this.sendCommand(Buffer.from([
+			0xb4, 2, 1, (active ? 0 : 1),
+			0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff]))
+	}
+	cmdQueryData() {
+		this.sendCommand(Buffer.from([
+			0xb4, 4,
+			0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff,
+		]))
+	}
+	cmdSetDeviceId(id /* abcd */) {
+		let b = Buffer.from(id, 'hex')
+		this.sendCommand(Buffer.from([
+			0xb4, 5,
+			0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+			b[0],
+			b[1],
+			0xff, 0xff,
+		]))
+	}
+	cmdPower(sleep) {
+		this.sendCommand(Buffer.from([
+			0xb4, 6, 1,
+			sleep ? 0 : 1,
+			0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+			0xff, 0xff,
+		]))
+	}
+	cmdCycle(interval) { // 0 = non-stop
+		this.sendCommand(Buffer.from([
+			0xb4, 8, 1,
+			interval,
+			0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+			0xff, 0xff,
+		]))
+	}
+	ready() {
+		this.emit('ready')
 	}
 }
 
+module.exports = SDS011
 
 if (!module.parent) {
-	_sds011.init(process.argv[2], (err, sds) => {
-		if (err) console.log(err)
-		sds.on('readout', (readout) => {
-			console.log('--');
-			console.log(`PM10: ${readout.pm10} (${readout.pm10_grade})`)
-			console.log(`PM2.5: ${readout.pm25} (${readout.pm25_grade})`)
-		})
+	let m = new SDS011(process.argv[2], 9600)
+	m.on('ready', () => {
+		console.log(' -- setting reporting mode to active')
+		m.cmdSetReportingMode(true)
+	})
+	m.on('response', (r) => {
+		if (r.type === 'repmode') {
+			console.log(' -- setiing duty cycle')
+			m.cmdCycle(2)
+		} else if (r.type === 'cycle') {
+			console.log(' -- ready - awaiting readings')
+		} else if (r.tpye === 'readout') {
+			console.log(r)
+		}
 	})
 }
